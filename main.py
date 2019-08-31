@@ -1,6 +1,5 @@
 #!/usr/bin/python
 """ Main script for R2_Control """
-from __future__ import print_function
 # ===============================================================================
 # Copyright (C) 2014 Darren Poulson
 #
@@ -19,51 +18,43 @@ from __future__ import print_function
 # You should have received a copy of the GNU General Public License
 # along with R2_Control.  If not, see <http://www.gnu.org/licenses/>.
 # ===============================================================================
-
+from __future__ import print_function
+import os
+import time
+import datetime
+import logging
+import logging.handlers
 from future import standard_library
+from flask import Flask, request, render_template
+from r2utils import telegram, internet, mainconfig
 standard_library.install_aliases()
 from builtins import str
 from configparser import ConfigParser
-import os
-import sys
-import time
-import datetime
-import socket
-import requests
-from flask import Flask, request, render_template
 
-sys.path.append("./classes/")
-from config import mainconfig
 
-modules = mainconfig['modules'].split(",")
-plugins = mainconfig['plugins'].split(",")
-i2c_bus = mainconfig['busid']
-logtofile = mainconfig['logtofile']
-logdir = mainconfig['logdir']
-logfile = mainconfig['logfile']
+modules = mainconfig.mainconfig['modules'].split(",")
+plugins = mainconfig.mainconfig['plugins'].split(",")
+i2c_bus = mainconfig.mainconfig['busid']
+logtofile = mainconfig.mainconfig['logtofile']
+logdir = mainconfig.mainconfig['logdir']
+logfile = mainconfig.mainconfig['logfile']
 
 config = ConfigParser({'busid': '1', 'logfile': 'test.log', 'logdir': './logs',
-                       'logtofile': True, 'modules': 'dome', 'plugins': 'audio'})
+                       'modules': 'dome', 'plugins': 'Audio,GPIO', 'loglevel': 'ERROR'})
 config.read('config/main.cfg')
 
 plugin_names = {
-    'flthy':'FlthyHPControl',
-    'scripts':'ScriptControl',
-    'audio':'AudioLibrary',
-    'vader':'VaderPSIControl',
-    'dome':'DomeControl',
-    'gpio':'GPIOControl',
-    'smoke':'SmokeControl'}
+    'flthy': 'Lights.FlthyHPControl',
+    'rseries': 'Lights.RSeriesLogicEngine',
+    'psi_matrix': 'Lights.PSI_Matrix',
+    'Scripts': 'Scripts.ScriptControl',
+    'Audio': 'Audio.AudioLibrary',
+    'vader': 'Lights.VaderPSIControl',
+    'teecees': 'Lights.TeeceesControl',
+    'Dome': 'Dome',
+    'GPIO': 'GPIO.GPIOControl',
+    'Smoke': 'Smoke'}
 
-def check_internet():
-    """ Tries to do a DNS lookup to see if we have an internet connection """
-    try:
-        host = socket.gethostbyname("www.google.com")
-        socket.create_connection((host, 80), 2)
-        internet_connection = True
-    except Exception as e:
-        internet_connection = False
-    return internet_connection
 
 def list_joysticks():
     """ Returns a list of joysticks available """
@@ -73,23 +64,6 @@ def list_joysticks():
         if ".isjoystick" in files:
             result.append(root.replace(path + "/", ''))
     return result
-
-def send_telegram(message):
-    """ Sends a telegram message """
-    global internet_connection
-    if check_internet():
-        try:
-            send_message = 'https://api.telegram.org/bot' + config.get('telegram', 'token')
-            send_message += '/sendMessage?chat_id=' + config.get('telegram', 'chat_id')
-            send_message += '&parse_mode=Markdown&text='
-            send_message += message
-            requests.get(send_message)
-        except:
-            if __debug__:
-                print("Thought we had an internet connection, but sending Telegram failed")
-    else:
-        if __debug__:
-            print("Tried to send Telegram, but no internet connection")
 
 
 def system_status():
@@ -107,26 +81,31 @@ def system_status():
     status = "Current Status\n"
     status += "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-\n"
     status += "Uptime: \t%s\n" % uptime_string
-    status += "Main Battery: \t%5.3f (balance: %5.3f)\n" % (monitor.queryBattery(),
-                                                            monitor.queryBatteryBalance())
+    if "monitor" in modules:
+        status += "Main Battery: \t%5.3f (balance: %5.3f)\n" % (monitor.queryBattery(),
+                                                                monitor.queryBatteryBalance())
     status += "Remote Battery: %s%%\t\n" % remote_battery
     status += "Wifi: \t\t\n"
-    status += "Internet: \t%s \n" % check_internet()
+    status += "Internet: \t%s \n" % internet.check()
     status += "Location: \t\n"
-    status += "Volume: \t%s\n" % p['audio'].audio.ShowVolume()
+    status += "Volume: \t%s\n" % p['Audio'].audio.ShowVolume()
     status += "--------------\n"
     status += "Scripts Running:\n"
-    status += p['scripts'].scripts.list_running()
+    status += p['Scripts'].scripts.list_running()
     return status
 
-# If logtofile is set, open log file
-if logtofile:
-    if __debug__:
-        print("Opening log file: Dir: %s - Filename: %s" % (logdir, logfile))
-    f = open(logdir + '/' + logfile, 'at')
-    f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-            " : ****** r2_control started ******\n")
-    f.flush
+
+# Setup logging
+log_filename = logdir + '/' + logfile
+# Create target Directory if don't exist
+if not os.path.exists(logdir):
+    os.mkdir(logdir)
+    print("Creating logdir " + logdir);
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s',
+                    filename=log_filename,
+                    filemode='w')
+logging.info("**** Starting r2_control")
 
 
 ######################################
@@ -134,19 +113,22 @@ if logtofile:
 
 # Initialise server controllers
 if "body" in modules:
-    from ServoControl import ServoControl
-    pwm_body = ServoControl(int(config.get('body', 'address'), 16),
-                            config.get('body', 'config_file'))
+    from Hardware.Servo import ServoControl
+    logging.info("Adding Body ServoControl")
+    pwm_body = ServoControl.ServoControl(int(config.get('body', 'address'), 16),
+                                         config.get('body', 'config_file'))
 if "dome" in modules:
-    from ServoControl import ServoControl
-    pwm_dome = ServoControl(int(config.get('dome', 'address'), 16),
-                            config.get('dome', 'config_file'))
+    from Hardware.Servo import ServoControl
+    logging.info("Adding Dome ServoControl")
+    pwm_dome = ServoControl.ServoControl(int(config.get('dome', 'address'), 16),
+                                         config.get('dome', 'config_file'))
 
 # Monitoring
 if "monitoring" in modules:
-    from i2cMonitor import i2cMonitor
-    monitor = i2cMonitor(int(config.get('monitoring', 'address'), 16),
-                         float(config.get('monitoring', 'interval')))
+    from Hardware.Monitoring import i2cMonitor
+    logging.info("Adding Hardware Monitoring")
+    monitor = i2cMonitor.i2cMonitor(int(config.get('monitoring', 'address'), 16),
+                                    float(config.get('monitoring', 'interval')))
 
 app = Flask(__name__, template_folder='templates')
 
@@ -163,14 +145,12 @@ def index():
 #############################
 # Servo API calls
 #
-
 @app.route('/servo/', methods=['GET'])
 @app.route('/servo/list', methods=['GET'])
 def servo_list():
     """GET to list all current servos and position"""
     message = ""
-    if __debug__:
-        print("Listing servos")
+    logging.info("Listing servos")
     if request.method == 'GET':
         message += pwm_body.list_servos()
         message += pwm_dome.list_servos()
@@ -181,8 +161,7 @@ def servo_list():
 def servo_list_dome():
     """GET to list all current servos and position"""
     message = ""
-    if __debug__:
-        print("Listing servos")
+    logging.info("Listing dome servos")
     if request.method == 'GET':
         message += pwm_dome.list_servos()
     return message
@@ -192,8 +171,7 @@ def servo_list_dome():
 def servo_list_body():
     """GET to list all current servos and position"""
     message = ""
-    if __debug__:
-        print("Listing servos")
+    logging.info("Listing body servos")
     if request.method == 'GET':
         message += pwm_body.list_servos()
     return message
@@ -202,10 +180,9 @@ def servo_list_body():
 @app.route('/servo/<part>/<servo_name>/<servo_position>/<servo_duration>', methods=['GET'])
 def servo_move(part, servo_name, servo_position, servo_duration):
     """GET will move a selected servo to the required position over a set duration"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo move: " + servo_name + "," + servo_position +
-                "," + servo_duration + "\n")
+    logging.info(
+                "Servo move: " + servo_name + "," + servo_position +
+                "," + servo_duration)
     if request.method == 'GET':
         if part == 'body':
             pwm_body.servo_command(servo_name, servo_position, servo_duration)
@@ -217,9 +194,7 @@ def servo_move(part, servo_name, servo_position, servo_duration):
 @app.route('/servo/close', methods=['GET'])
 def servo_close():
     """GET to close all servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo close: \n")
+    logging.info("All Servo close")
     if request.method == 'GET':
         pwm_body.close_all_servos(0)
         pwm_dome.close_all_servos(0)
@@ -230,42 +205,37 @@ def servo_close():
 @app.route('/servo/dome/close', methods=['GET'])
 def servo_dome_close():
     """GET to close all dome servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo close dome: \n")
+    logging.info("All dome Servo close")
     if request.method == 'GET':
         pwm_dome.close_all_servos(0)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/dome/close/<duration>', methods=['GET'])
 def servo_dome_close_slow(duration):
     """GET to close all dome servos slowly"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo close dome slow: \n")
+    logging.info("Servo close dome slow")
     if request.method == 'GET':
         pwm_dome.close_all_servos(duration)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/body/close', methods=['GET'])
 def servo_body_close():
     """GET to close all body servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo close body: \n")
+    logging.info("Servo close body")
     if request.method == 'GET':
         pwm_body.close_all_servos(0)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/body/close/<duration>', methods=['GET'])
 def servo_body_close_slow(duration):
     """GET to close all body servos slowly"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo close body slow:\n")
+    logging.info("Servo close body slow") 
     if request.method == 'GET':
         pwm_body.close_all_servos(duration)
         return "Ok"
@@ -275,9 +245,7 @@ def servo_body_close_slow(duration):
 @app.route('/servo/open', methods=['GET'])
 def servo_open():
     """GET to open all servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo open: \n")
+    logging.info("All Servo close")
     if request.method == 'GET':
         pwm_body.open_all_servos(0)
         pwm_dome.open_all_servos(0)
@@ -288,50 +256,47 @@ def servo_open():
 @app.route('/servo/dome/open', methods=['GET'])
 def servo_dome_open():
     """GET to open all dome servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo open dome: \n")
+    logging.info("Servo open dome")
     if request.method == 'GET':
         pwm_dome.open_all_servos(0)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/dome/open/<duration>', methods=['GET'])
 def servo_dome_open_slow(duration):
     """GET to open all dome servos slowly"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo open dome slow: \n")
+    logging.info("Servo open dome slow")
     if request.method == 'GET':
         pwm_dome.open_all_servos(duration)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/body/open', methods=['GET'])
 def servo_body_open():
     """GET to open all body servos"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo open body: \n")
+    logging.info("Servo open body")
     if request.method == 'GET':
         pwm_body.open_all_servos(0)
         return "Ok"
     return "Fail"
 
+
 @app.route('/servo/body/open/<duration>', methods=['GET'])
 def servo_body_open_slow(duration):
     """GET to open all body servos" slowly """
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Servo open body slow: \n")
+    logging.info("Servo open body slow") 
     if request.method == 'GET':
         pwm_body.open_all_servos(duration)
         return "Ok"
     return "Fail"
 
+
 p = {}
 for x in plugins:
-    p[x] = __import__(plugin_names[x], fromlist=[x, 'api'])
+    logging.info("Loading %s" % x)
+    p[x] = __import__("Hardware." + plugin_names[x], fromlist=[str(x), 'api'])
     app.register_blueprint(p[x].api)
 
 if __debug__:
@@ -340,25 +305,23 @@ if __debug__:
     print(p)
     print("============================================")
 
+
 #######################
 # System API calls
 @app.route('/joystick', methods=['GET'])
 @app.route('/joystick/list', methods=['GET'])
 def joystick_list():
     """GET to display list of possible joysticks"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Retrieving list of joysticks\n")
+    logging.info("Retrieving list of joysticks")
     if request.method == 'GET':
         return '\n'.join(list_joysticks())
     return "Fail"
 
+
 @app.route('/joystick/current', methods=['GET'])
 def joystick_current():
     """GET to display current joystick"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Retrieving current joystick\n")
+    logging.info("Retrieving current joystick")
     if request.method == 'GET':
         with open("controllers/.current", "r") as current_joy:
             current = current_joy.read()
@@ -369,34 +332,26 @@ def joystick_current():
 @app.route('/joystick/<stick>', methods=['GET'])
 def joystick_change(stick):
     """GET to change joystick to <stick> """
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : Changing joystick to " + stick + "\n")
+    logging.info("Changing joystick to " + stick)
     if request.method == 'GET':
         message = "Invalid stick"
         for valid in list_joysticks():
-            if __debug__:
-                print("Checking controller type is valid: " + valid)
+            logging.info("Checking controller type is valid: " + valid)
             if valid == stick:
-                if __debug__:
-                    print("Valid stick")
                 message = "Valid stick. Changed to " + stick
                 with open("controllers/.current", "w") as current_joy:
                     current_joy.write(stick)
                 if "telegram" in modules:
-                    send_telegram("Setting joystick to " + stick)
-                print("End of loop")
+                    telegram.send("Setting joystick to " + stick)
     return message
 
 
 @app.route('/shutdown/now', methods=['GET'])
 def shutdown():
     """GET to shutdown Raspberry Pi"""
-    if logtofile:
-        f.write(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S') +
-                " : ****** Shutting down ****** \n")
+    logging.info("****** Shutting down ******")
     if "telegram" in modules:
-        send_telegram("Night night...")
+        telegram.send("Night night...")
     if request.method == 'GET':
         os.system('shutdown now -h')
         s = open("controllers/.shutdown", "w+")
@@ -414,17 +369,19 @@ def sysstatus():
         message = system_status()
     return message
 
+
 @app.route('/sendstatus', methods=['GET'])
 def sendstatus():
     """GET to send system status via telegram"""
     message = ""
     if request.method == 'GET':
         if "telegram" in modules:
-            send_telegram(system_status())
+            telegram.send(system_status())
             message = "Sent"
         else:
             message = "Telegram module not configured"
     return message
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=__debug__, use_reloader=False, threaded=True)
